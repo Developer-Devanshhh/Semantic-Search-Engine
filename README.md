@@ -20,25 +20,31 @@ graph TD
     Q([User Query]) ::: client --> API[FastAPI Async Endpoint] ::: internal
 
     subgraph Embedding
-        API --> MRL[all-MiniLM-L6-v2 <br/> MRL Truncated to 128-dim] ::: internal
+        API --> MRL["all-MiniLM-L6-v2<br/>MRL Truncated to 128-dim"] ::: internal
     end
 
     subgraph Fuzzy Routing
-        MRL --> UMAP[UMAP Manifold Reduction <br/> 128-dim → 15-dim] ::: internal
-        UMAP --> GMM[Gaussian Mixture Model <br/> Probability Matrix] ::: internal
+        MRL --> UMAP["UMAP Manifold Reduction<br/>128-dim → 15-dim"] ::: internal
+        UMAP --> GMM["Gaussian Mixture Model<br/>Probability Matrix P(k|q)"] ::: internal
     end
 
     subgraph Cluster-Partitioned Cache
-        GMM -- "Top 2 Clusters P(k|q)" --> Cache{Cache Lookup <br/> O_N/K} ::: database
+        GMM -- "Top 2 Clusters" --> Cache{"Cache Lookup<br/>O(N/K)"} ::: database
         Cache -- "Sim >= Adaptive τ" --> Hit((Cache Hit)) ::: client
     end
 
     subgraph Deep Search
-        Cache -- "Sim < Adaptive τ" --> Faiss[(FAISS IndexIVFPQ)] ::: database
+        Cache -- "Sim < Adaptive τ" --> Faiss[("FAISS IndexIVFPQ<br/>(Inverted File)")] ::: database
         Faiss --> Result((Retrieve Top-K)) ::: client
         Result -. "Store with Frequency Weighting" .-> Cache
     end
 ```
+
+The system breaks down the search process into three distinct phases to ensure sub-millisecond latency even as the corpus grows:
+
+1.  **Fuzzy Routing Phase:** The incoming query is embedded and immediately projected into a 15-dimensional manifold using UMAP. A pre-trained Gaussian Mixture Model (GMM) evaluates this projection and outputs a probability distribution across $K$ clusters.
+2.  **Partitioned Caching Phase:** Instead of checking a global cache, the system only checks the buckets belonging to the top 2 most probable clusters. It requires the query to pass an **Adaptive Similarity Threshold ($\tau$)** that is customized for that specific cluster's density.
+3.  **Deep Search Phase:** If (and only if) the cache misses, the system executes a quantized search against the FAISS Inverted File index. The results are returned to the user and asynchronously written back to the appropriate cluster bucket in the cache.
 
 ---
 
