@@ -10,34 +10,89 @@ This engine is built on the [20 Newsgroups](https://archive.ics.uci.edu/dataset/
 
 Instead of falling into the trap of scanning an entire flat vector database for every query (O(N) lookup), this system utilizes a multi-layered hierarchical routing approach.
 
-```mermaid
-graph TD
-    %% Styling
-    classDef internal fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc;
-    classDef database fill:#0f172a,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
-    classDef client fill:#334155,stroke:#94a3b8,stroke-width:2px,color:#f8fafc,rx:10,ry:10;
+### High-Level Query Flow
 
-    Q([User Query]) ::: client --> API[FastAPI Async Endpoint] ::: internal
+```text
+[ User Query ]
+      │
+      ▼
+[ FastAPI Async Endpoint ]  ──► (Offloads heavy compute to worker thread)
+      │
+      ▼
+===========================================================================
+ PHASE 1: EMBEDDING & ROUTING
+===========================================================================
+      │
+      ├─► [ Embedder ]
+      │     └─ Model: all-MiniLM-L6-v2
+      │     └─ Constraint: MRL Truncated to 128-dim (3x faster, 3x smaller)
+      │
+      ├─► [ UMAP Reducer ]
+      │     └─ 128-dim ──► 15-dim Manifold Projection
+      │
+      └─► [ GMM Soft Clustering ]
+            └─ Evaluates 15-dim projection
+            └─ Outputs: P(k|q) Probability matrix across K=34 clusters
 
-    subgraph Embedding
-        API --> MRL["all-MiniLM-L6-v2<br/>MRL Truncated to 128-dim"] ::: internal
-    end
+      │
+      ▼
+===========================================================================
+ PHASE 2: CLUSTER-PARTITIONED CACHE O(N/K)
+===========================================================================
+      │
+      ├─► [ Cache Controller ]
+      │     └─ Identifies Top 2 most probable clusters from GMM
+      │     └─ Checks ONLY those specific buckets
+      │     └─ Fetches Cluster-Specific Adaptive Threshold (τ)
+      │
+      ├─► IF Similarity ≥ τ  ──► [ 🟢 CACHE HIT ] ──► Return instantly
+      │
+      └─► IF Similarity < τ  ──► [ 🔴 CACHE MISS ] ──► Proceed to Phase 3
 
-    subgraph Fuzzy Routing
-        MRL --> UMAP["UMAP Manifold Reduction<br/>128-dim → 15-dim"] ::: internal
-        UMAP --> GMM["Gaussian Mixture Model<br/>Probability Matrix P(k|q)"] ::: internal
-    end
+      │
+      ▼
+===========================================================================
+ PHASE 3: DEEP SEARCH & CACHE UPDATE
+===========================================================================
+      │
+      ├─► [ FAISS IndexIVFPQ ]
+      │     └─ Quantized Inverted File Index
+      │     └─ Retrieves exact Nearest Neighbors (Top-K)
+      │
+      ├─► [ 🔵 RETURN RESULTS ]
+      │
+      └─► [ Cache Updater ]
+            └─ Asynchronously writes query + result to dominant cluster bucket
+            └─ Applies Frequency-Weighted Eviction if bucket is full
+```
 
-    subgraph Cluster-Partitioned Cache
-        GMM -- "Top 2 Clusters" --> Cache{"Cache Lookup<br/>O(N/K)"} ::: database
-        Cache -- "Sim >= Adaptive τ" --> Hit((Cache Hit)) ::: client
-    end
+### Core Components Diagram
 
-    subgraph Deep Search
-        Cache -- "Sim < Adaptive τ" --> Faiss[("FAISS IndexIVFPQ<br/>(Inverted File)")] ::: database
-        Faiss --> Result((Retrieve Top-K)) ::: client
-        Result -. "Store with Frequency Weighting" .-> Cache
-    end
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          DATA PREPROCESSING                             │
+├──────────────┬───────────────────┬──────────────────┬───────────────────┤
+│ 1. Raw Text  │ 2. Deep Clean     │ 3. Embed (MRL)   │ 4. Vector Store   │
+│ (20News)     │ (Regex Pipeline)  │ (128-dim)        │ (FAISS IVF-PQ)    │
+└──────────────┴───────────────────┴──────────────────┴───────────────────┘
+                                   │                  │
+                                   ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       CLUSTER MAPPING (OFFLINE)                         │
+├──────────────────────────────────┬──────────────────────────────────────┤
+│ 1. UMAP Reduction (128D -> 15D)  │ 2. GMM Bayesian Sweep (Find K)       │
+├──────────────────────────────────┴──────────────────────────────────────┤
+│ ► Establishes baseline geometry and mathematically proves optimal K=34  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       LIVE API INFERENCE (ONLINE)                       │
+├─────────────────┬────────────────┬──────────────────┬───────────────────┤
+│ 1. Async Query  │ 2. MRL Embed   │ 3. GMM Predict   │ 4. Cache Lookup   │
+├─────────────────┴────────────────┴──────────────────┴───────────────────┤
+│ ► Cache Miss? -> FAISS Search -> Return -> Cache Update                 │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 The system breaks down the search process into three distinct phases to ensure sub-millisecond latency even as the corpus grows:
