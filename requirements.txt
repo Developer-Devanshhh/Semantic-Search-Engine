@@ -1,0 +1,23 @@
+# Core ML
+sentence-transformers==3.4.1
+torch>=2.2.0
+numpy>=1.26.0
+
+# Vector database
+faiss-cpu==1.9.0.post1
+
+# Clustering & dimensionality reduction
+scikit-learn>=1.5.0
+umap-learn>=0.5.7
+
+# API
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic>=2.7.0
+
+# Data loading
+datasets>=3.0.0
+
+# Utilities
+tqdm>=4.66.0
+joblib>=1.4.0
